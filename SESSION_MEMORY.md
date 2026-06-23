@@ -16,49 +16,44 @@
 - Initialized the `GTGRP/pol_lp` repository (`.gitignore`, `README.md`).
 - Created branch `phase-0-foundations` and opened a PR for Phase 0.
 - Scaffolded the TypeScript project: `package.json`, `tsconfig.json`, `.env.example`.
-- Built core modules:
-  - `src/core/types.ts` — shared domain types (order book, best quote, reward config, Gamma market, sides/outcomes).
-  - `src/core/config.ts` — env-driven config; defaults to **paper mode**; signature type 3 (POLY_1271) wiring; all tunables documented.
-  - `src/core/logger.ts` — leveled, timestamped logger.
-  - `src/core/clob.ts` — CLOB v2 REST client wrapper: public market/book/rewards reads + **L2 HMAC auth** header builder; L1 (EIP-712) key derivation + order signing left as a clearly-marked Phase 3 interface.
-  - `src/core/gamma.ts` — Gamma market-discovery client (active, reward-bearing markets).
-  - `src/ws/clobMarketWs.ts` — single CLOB market-channel WebSocket client with data-quality Layers 1/3/4 (pre-warm, stale-tick guard, drop-first-tick) and instant `market_resolved` detection.
-  - `src/ws/parallelWsManager.ts` — **parallel WebSocket manager**: N redundant connections (Layer 2), staggered starts (Layer 5), per-connection health + jitter-EMA scoring, and auto-pruning of erratic connections with a respawn budget (Layer 6). Merges data by freshest tick per token.
-  - `src/main.ts` — Phase 0 entry point / smoke test: loads config, discovers a few reward markets, boots the parallel WS, prints live best bid/ask + connection health.
+- Built core modules: `types.ts`, `config.ts` (defaults to paper mode; sig type 3 wiring), `logger.ts`, `clob.ts` (CLOB v2 REST + L2 HMAC auth; L1/signing deferred to Phase 3), `gamma.ts` (market discovery), `ws/clobMarketWs.ts` (single CLOB market-channel WS with pre-warm/stale-tick/drop-first-tick + market_resolved), `ws/parallelWsManager.ts` (N redundant connections, staggered starts, jitter-EMA pruning), `main.ts` (smoke test).
 
-**Why we did it this way**
-- **TypeScript-only** for Phase 0–2 to guarantee a clean compile with no cross-language integration errors (per the requirement that everything compiles and runs clean). Rust stays an optional Phase-4 latency fast-path, not a hard dependency.
-- Implemented auth/REST/WS directly on `ethers` + native `fetch` + `ws` (all stable) instead of pinning to a fast-moving SDK surface, so the codebase compiles deterministically. The CLOB client is wrapped behind an interface, so we can swap in the official SDK later without touching strategy code.
-- Ported the v2 bot's parallel-WS + 6-layer data-quality design because ms-accurate, redundant order-book data is exactly what protects an LP maker from adverse selection and lets us cancel before toxic fills.
+**Why** TypeScript-only for a clean compile; ms-accurate redundant book is the core defense against adverse selection.
 
-**Findings**
-- v2 bot's parallel WS used Binance book-ticker feeds; for an LP bot the relevant feed is the **Polymarket CLOB market channel** (`book`, `price_change`, `best_bid_ask`, `last_trade_price`, `market_resolved`). The manager was generalized accordingly.
-- CLOB market channel requires a PING roughly every 10s; we ping at 8s.
-- `market_resolved` is critical: it lets us stop quoting/selling instantly instead of getting run over at resolution.
+**Findings** CLOB market channel events: book / price_change / best_bid_ask / last_trade_price / market_resolved; ping ~8s; market_resolved lets us stop instantly.
 
-**Next steps (Phase 1)**
-- Implement `rewards/scorer.ts` (replicate Qn: quadratic spread penalty, size cutoff, two-sided bonus), `rewards/estimator.ts` ($/day given a quote config + competition), and `rewards/calibrator.ts` (poll order-scoring + per-user reward % to tune the estimator against reality).
+**Next** Phase 1 reward brain.
 
 ---
 
 ## 2026-06-23 18:22 IST — Phase 1: Reward Brain
 
 **What was done**
-- Merged Phase 0 into `main` (squash) and branched `phase-1-reward-brain`.
-- Added the reward brain under `src/rewards/`:
-  - `scorer.ts` — replicates Polymarket's liquidity-rewards scoring ("Qn"): quadratic spread decay `((maxSpread - spread)/maxSpread)^b`, `maxSpread` cutoff, `minSize` cutoff, and a **two-sided binding score** = `min(qBid, qAsk)` so lopsided books earn ~nothing. Every constant is configurable.
-  - `estimator.ts` — converts a score into expected USDC/day via `pool * myScore / (competitorScore + myScore)`, plus capital-at-risk, daily return %, and naive APR. Models diminishing returns from over-sizing and crowding.
-  - `calibrator.ts` — EMA calibration factor that reconciles our estimates against the **real** authenticated endpoints (`getUserRewardsEarnings`, `getOrderScoring`), clamped to [0.2, 5], pulling the model toward ~99% of real behaviour.
-  - `index.ts` — public surface for the reward brain.
+- Merged Phase 0 to `main`; branched `phase-1-reward-brain`.
+- Added `src/rewards/`: `scorer.ts` (Qn: quadratic spread decay, maxSpread/minSize cutoffs, two-sided binding score min(qBid,qAsk)), `estimator.ts` (USDC/day = pool*myScore/(competitorScore+myScore), APR), `calibrator.ts` (EMA factor reconciling estimates vs real order-scoring + earnings endpoints), `index.ts`.
 
-**Why we did it this way**
-- The whole edge of LP farming is: *quote as tightly and two-sided as possible without getting adversely filled*. The scorer makes “tightness” and “two-sidedness” first-class, quantified signals the strategy layer (Phase 2) can optimize against.
-- We deliberately treat the formula as a **model + calibrator** rather than hard-coding Polymarket’s exact constants, because those constants change and per-market configs vary. Calibration keeps us honest against reality.
-- `min(qBid, qAsk)` as the reward-binding score encodes the real two-sided requirement and discourages the strategy from farming one side only.
+**Why** Make tightness + two-sidedness first-class quantified signals; treat the formula as model+calibrator since constants drift.
 
-**Findings**
-- Reward share is a fraction of the pool, so beyond a point adding size mostly cannibalizes our own share — the estimator surfaces this so sizing logic (Phase 2) won’t over-commit capital.
-- Order-scoring endpoint lets us confirm in real time whether a resting order is actually qualifying — this becomes a live guardrail in Phase 2/3.
+**Findings** Reward share has diminishing returns to size; order-scoring endpoint gives a live qualifying check.
 
-**Next steps (Phase 2)**
-- Paper engine: `quoter` (places two-sided orders inside the reward band using the scorer/estimator), `inventoryManager`, `riskGuard`, and a `crossing-fill simulator` that fills our resting orders when real trades cross their price (using the live WS feed), with full PnL/fees/gas accounting so paper tracks live to ~99%.
+**Next** Phase 2 paper engine.
+
+---
+
+## 2026-06-23 18:41 IST — Phase 2: Paper Engine
+
+**What was done**
+- Merged Phase 1 to `main`; branched `phase-2-paper-engine`.
+- `src/core/fees.ts` — configurable maker/taker bps + gas model (Polymarket fees currently 0; gasless orders).
+- `src/paper/fillSimulator.ts` — **crossing-fill simulator**: a resting BUY fills only when a real trade prints at/below it; a SELL when a print is at/above it; maker fills at our price; better-priced orders fill first; respects known trade size.
+- `src/paper/paperEngine.ts` — full paper account: USDC balance, positions w/ average cost, open orders, realized/unrealized PnL, fees, gas, accrued rewards, fill count; `snapshot()` mark-to-market.
+- `src/strategy/quoter.ts` — two-sided quotes inside the reward band (offsetFrac of maxSpread), skips toxic tails (<0.1 / >0.9), `reconcileQuotes` only reprices beyond tolerance to avoid churn.
+- `src/strategy/inventoryManager.ts` — maker take-profit exits for filled inventory; **dust management** (ignore < dustShares).
+- `src/strategy/riskGuard.ts` — pre-quote exposure/balance gating; **DriftDetection** (abandon markets marching to 0/1); **taker stop-loss**; **AdverseSelectionMonitor** (halt markets whose fill losses outrun rewards).
+- `src/run/paperRunner.ts` — ties live WS + strategy + paper engine into a loop: real trade prints drive fills; cycle re-quotes, gates risk, places inventory exits, accrues calibrated rewards. `src/main.ts` now runs this on `npm run paper`.
+
+**Why** This is the “99% close to real” paper mode requirement: fills come from real CLOB trade prints (not random), PnL includes fees/gas/rewards, and the same risk + inventory logic that live trading will use is exercised in paper.
+
+**Findings / limitations** When a trade print lacks size we fill the crossed order fully (slightly optimistic); queue position is approximated. These are flagged for Phase 3 reconciliation (compare paper vs live fills to tighten the model).
+
+**Next (Phase 3)** Live executor: L1 EIP-712 + POLY_1271 (sig type 3) API-key derivation, order signing, GTC create/cancel/replace with rate-limit handling, and paper/live reconciliation hooks.
