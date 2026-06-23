@@ -34,7 +34,7 @@ export class TelegramBot implements AlertSink {
 		this.chatId = chatId;
 		this.settings = settings;
 		this.hooks = hooks;
-		this.base = `https://api.telegram.org/bot${token}`;
+		this.base = "https://api.telegram.org/bot" + token;
 	}
 
 	async send(text: string): Promise<void> {
