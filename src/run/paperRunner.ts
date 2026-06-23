@@ -1,15 +1,13 @@
-// Paper runner (Phase 4/5) — selection engine + strategy registry + control panel.
+// Paper runner — broad funded-reward discovery + strategy registry + rich Telegram ops.
 //
-// Flow: discover reward markets -> score & select top N (>= act score) -> open
-// parallel WS over chosen YES (and NO, for arb) tokens -> each cycle pick the best
-// enabled strategy per market, gate risk, reconcile quotes, manage inventory, run
-// the optional cross-outcome stacked-arb maker, accrue calibrated rewards, and fire
-// per-strategy Telegram alerts. Settings are read live so the Telegram panel changes
-// behaviour without a restart.
+// Discovery is now based on the reference-repo pattern: scan Gamma broadly for live
+// markets, scan CLOB simplified/sampling markets for funded rewards, join by token /
+// condition, and only farm markets with actual funded reward rates when that CLOB
+// reward source is available.
 import type { AppConfig } from "../core/config.js";
 import { createLogger } from "../core/logger.js";
 import { GammaClient } from "../core/gamma.js";
-import { ClobRestClient } from "../core/clob.js";
+import { ClobRestClient, type ClobRewardSnapshot } from "../core/clob.js";
 import { ParallelWsManager } from "../ws/parallelWsManager.js";
 import { PaperEngine } from "../paper/paperEngine.js";
 import { reconcileQuotes, buildInventoryExit, netExposureUsd, canQuote, DriftDetector, AdverseSelectionMonitor, buildStackedArb, type ArbBook } from "../strategy/index.js";
@@ -17,37 +15,58 @@ import { selectStrategy, type StrategyOutput } from "../strategy/strategies.js";
 import { scoreSide, type QuoteOrder } from "../rewards/index.js";
 import { SettingsStore } from "../telegram/settingsStore.js";
 import { TelegramBot } from "../telegram/bot.js";
-import { NoopAlertSink, formatStrategyAlert, formatPnlAlert, type AlertSink } from "../telegram/alerts.js";
+import { NoopAlertSink, formatStrategyAlert, formatPnlAlert, formatDetailedStatus, formatMarketSelectedAlert, formatOrderPlacedAlert, formatFillAlert, type AlertSink } from "../telegram/alerts.js";
 import { Monitor } from "../monitor/monitor.js";
 import { selectTopMarkets, compositeScore, metricsFromBook, type MarketMetrics, type ScoredMarket } from "../select/marketSelector.js";
-import type { GammaMarket } from "../core/types.js";
+import type { GammaMarket, OrderBookSnapshot, ManagedOrder } from "../core/types.js";
 
 const log = createLogger("paper-runner");
 
 const REQUOTE_INTERVAL_MS = 10_000;
 const STATS_INTERVAL_MS = 15_000;
 const REPRICE_TOLERANCE = 0.005;
+const DEFAULT_DISCOVERY_GAMMA_LIMIT = 500;
+const DEFAULT_REWARD_SCAN_PAGES = 30;
 
 interface MarketCtx {
 	market: GammaMarket;
 	yesToken: string;
 	noToken: string | null;
 	scored: ScoredMarket;
+	reward: ClobRewardSnapshot | null;
+	lastBook: OrderBookSnapshot | null;
 	lastAlertStrategy: string | null;
 	lastAlertAt: number;
 	lastArbAlertAt: number;
 }
 
+function envNum(key: string, fallback: number): number {
+	const n = Number(process.env[key]);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 function hoursToResolution(m: GammaMarket): number | null {
-	const end = (m as any).endDate ?? (m as any).end_date_iso;
+	const end = m.endDateIso ?? (m as any).endDate ?? (m as any).end_date_iso;
 	if (!end) return null;
 	const ms = new Date(end).getTime() - Date.now();
 	return Number.isFinite(ms) ? ms / 3_600_000 : null;
 }
 
 function isSports(m: GammaMarket): boolean {
-	const hay = `${(m as any).category ?? ""} ${((m as any).tags ?? []).join(" ")} ${m.question}`.toLowerCase();
+	const hay = `${m.category ?? ""} ${((m as any).tags ?? []).join(" ")} ${m.question}`.toLowerCase();
 	return /\b(nba|nfl|mlb|nhl|soccer|football|tennis|ufc|game|match|vs\.?|cup)\b/.test(hay);
+}
+
+function getRewardForMarket(rewards: { byToken: Map<string, ClobRewardSnapshot>; byCondition: Map<string, ClobRewardSnapshot> }, m: GammaMarket): ClobRewardSnapshot | null {
+	for (const token of m.clobTokenIds) {
+		const byToken = rewards.byToken.get(token);
+		if (byToken) return byToken;
+	}
+	return rewards.byCondition.get(m.conditionId) ?? null;
+}
+
+function expectedExposureForOrder(o: ManagedOrder): number {
+	return Math.abs(o.price * o.size);
 }
 
 export async function runPaper(cfg: AppConfig): Promise<void> {
@@ -58,14 +77,15 @@ export async function runPaper(cfg: AppConfig): Promise<void> {
 	const adverse = new AdverseSelectionMonitor();
 	const settings = new SettingsStore();
 	const midpoints = new Map<string, number>();
+	const latestBooks = new Map<string, OrderBookSnapshot>();
 	const lastTradeByToken = new Map<string, number>();
 
-	// Alert sink: Telegram if configured, else no-op.
+	let ctxs: MarketCtx[] = [];
 	let sink: AlertSink = new NoopAlertSink();
 	let bot: TelegramBot | null = null;
 	if (cfg.telegramBotToken && cfg.telegramChatId) {
 		bot = new TelegramBot(cfg.telegramBotToken, cfg.telegramChatId, settings, {
-			status: () => `mode=paper | markets=${ctxs.length} | open=${paper.getOpenOrders().length} | bal=$${paper.getBalance().toFixed(2)}`,
+			status: () => formatDetailedStatus({ mode: "paper", markets: ctxs.length, snapshot: paper.snapshot(midpoints), openOrders: paper.getOpenOrders() }),
 			pnl: () => formatPnlAlert(paper.snapshot(midpoints)),
 		});
 		bot.start();
@@ -73,34 +93,58 @@ export async function runPaper(cfg: AppConfig): Promise<void> {
 	}
 	const monitor = new Monitor(sink, { minAlertIntervalMs: settings.getNum("ALERTS.MIN_INTERVAL_SEC") * 1000 });
 
-	// ---- Discover + score + select markets.
-	log.info("discovering reward-bearing markets...");
-	let markets = await gamma.getRewardMarkets(50);
-	if (markets.length === 0) markets = await gamma.getActiveMarkets(20);
-	const candidates = markets.filter((m) => m.clobTokenIds.length >= 1).slice(0, 15);
+	// ---- Discover funded reward markets.
+	const gammaLimit = envNum("DISCOVERY_GAMMA_LIMIT", DEFAULT_DISCOVERY_GAMMA_LIMIT);
+	const rewardPages = envNum("CLOB_REWARD_SCAN_PAGES", DEFAULT_REWARD_SCAN_PAGES);
+	log.info(`discovering funded reward markets (Gamma limit=${gammaLimit}, CLOB reward pages=${rewardPages})...`);
+	const [rewardState, activeMarkets] = await Promise.all([
+		clob.getRewardMarketSnapshots(rewardPages),
+		gamma.getActiveMarkets(gammaLimit),
+	]);
+	const hasClobRewardSource = rewardState.byToken.size > 0 || rewardState.byCondition.size > 0;
+	log.info(`discovery join: activeGamma=${activeMarkets.length}, clobRewardTokens=${rewardState.byToken.size}, clobRewardConditions=${rewardState.byCondition.size}, source=${rewardState.source}`);
+
+	let rewardMarkets = activeMarkets
+		.filter((m) => m.clobTokenIds.length >= 1)
+		.filter((m) => m.active && !m.closed && !m.archived && m.acceptingOrders !== false && m.enableOrderBook !== false)
+		.map((m) => ({ market: m, reward: getRewardForMarket(rewardState, m) }))
+		.filter((x) => (hasClobRewardSource ? x.reward !== null : (x.market.rewardsDailyRate ?? 0) > 0));
+
+	// Enrich Gamma reward fields from CLOB rewards, because CLOB rewards.rates is the
+	// authoritative funded-rate source.
+	rewardMarkets = rewardMarkets.map((x) => {
+		if (x.reward) {
+			x.market.rewardsDailyRate = x.reward.rewardDailyRate;
+			x.market.rewardsMinSize = x.reward.rewardMinSize;
+			x.market.rewardsMaxSpread = x.reward.rewardMaxSpread;
+		}
+		return x;
+	});
+	log.info(`funded reward candidates after strict filter: ${rewardMarkets.length}`);
 
 	const metrics: MarketMetrics[] = [];
-	const byToken = new Map<string, GammaMarket>();
-	for (const m of candidates) {
-		const token = m.clobTokenIds[0];
-		byToken.set(token, m);
+	const byToken = new Map<string, { market: GammaMarket; reward: ClobRewardSnapshot | null; book: OrderBookSnapshot }>();
+	for (const { market, reward } of rewardMarkets) {
+		const token = market.clobTokenIds[0];
 		try {
 			const book = await clob.getOrderBook(token);
+			latestBooks.set(token, book);
+			byToken.set(token, { market, reward, book });
 			metrics.push(
 				metricsFromBook(
 					{
 						tokenId: token,
-						question: m.question,
-						rewardPerDay: m.rewardsDailyRate ?? 0,
-						rewardPool: m.rewardsDailyRate ?? 0,
-						volume24h: Number((m as any).volume24hr ?? (m as any).volume ?? 0),
-						isSports: isSports(m),
+						question: market.question,
+						rewardPerDay: reward?.rewardDailyRate ?? market.rewardsDailyRate ?? 0,
+						rewardPool: reward?.rewardDailyRate ?? market.rewardsDailyRate ?? 0,
+						volume24h: Number(market.volume24hr ?? 0),
+						isSports: isSports(market),
 					},
 					book,
 				),
 			);
-		} catch {
-			/* skip markets we can't read */
+		} catch (e) {
+			log.debug(`skip book unreadable ${token.slice(0, 8)}... ${(e as Error).message}`);
 		}
 	}
 
@@ -108,21 +152,21 @@ export async function runPaper(cfg: AppConfig): Promise<void> {
 	const maxMarkets = settings.getNum("SELECTION.MAX_MARKETS");
 	let selected = selectTopMarkets(metrics, actScore, maxMarkets);
 	if (selected.length === 0 && metrics.length > 0) {
-		selected = metrics
-			.map((m) => ({ ...m, ...compositeScore(m) }))
-			.sort((a, b) => b.score10 - a.score10)
-			.slice(0, maxMarkets);
+		selected = metrics.map((m) => ({ ...m, ...compositeScore(m) })).sort((a, b) => b.score10 - a.score10).slice(0, maxMarkets);
 		const best = selected[0]?.score10 ?? 0;
-		log.warn(`no markets scored >= ${actScore}; fallback farming best available (${best.toFixed(1)}/10). Lower SELECTION.ACT_SCORE if you want this always.`);
-		await sink.send(`⚠️ no markets scored >= ${actScore}/10 — paper fallback farming best available (${best.toFixed(1)}/10)`);
+		log.warn(`no funded reward markets scored >= ${actScore}; fallback farming best funded rewards (${best.toFixed(1)}/10)`);
+		await sink.send(`⚠️ no funded reward markets scored >= ${actScore}/10 — farming best funded rewards (${best.toFixed(1)}/10)`);
 	}
-	const ctxs: MarketCtx[] = selected.map((s) => {
-		const m = byToken.get(s.tokenId)!;
+
+	ctxs = selected.map((s) => {
+		const item = byToken.get(s.tokenId)!;
 		return {
-			market: m,
+			market: item.market,
 			yesToken: s.tokenId,
-			noToken: m.clobTokenIds[1] ?? null,
+			noToken: item.market.clobTokenIds[1] ?? null,
 			scored: s,
+			reward: item.reward,
+			lastBook: item.book,
 			lastAlertStrategy: null,
 			lastAlertAt: 0,
 			lastArbAlertAt: 0,
@@ -130,14 +174,33 @@ export async function runPaper(cfg: AppConfig): Promise<void> {
 	});
 
 	if (ctxs.length === 0) {
-		log.error("no readable tradable markets found; nothing to farm");
-		await sink.send("⚠️ no readable tradable markets found right now");
+		log.error("no readable funded reward markets found; nothing to farm");
+		await sink.send("⚠️ no readable funded reward markets found right now");
 		return;
 	}
-	for (const c of ctxs) log.info(`farming [${c.scored.score10.toFixed(1)}/10] ${c.market.question.slice(0, 56)}`);
-	await sink.send(`🚀 farming ${ctxs.length} markets:\n` + ctxs.map((c) => `• ${c.scored.score10.toFixed(1)}/10 ${c.market.question.slice(0, 50)}`).join("\n"));
+	for (const c of ctxs) log.info(`farming funded reward [${c.scored.score10.toFixed(1)}/10] reward=$${(c.reward?.rewardDailyRate ?? c.market.rewardsDailyRate ?? 0).toFixed(2)}/day ${c.market.question.slice(0, 70)}`);
+	await sink.send(`🚀 farming ${ctxs.length} funded reward markets from ${rewardState.source}`);
+	for (let i = 0; i < ctxs.length; i += 1) {
+		const c = ctxs[i];
+		await sink.send(formatMarketSelectedAlert({
+			index: i + 1,
+			total: ctxs.length,
+			question: c.market.question,
+			slug: c.market.slug,
+			conditionId: c.market.conditionId,
+			yesToken: c.yesToken,
+			noToken: c.noToken,
+			score10: c.scored.score10,
+			rewardDaily: c.reward?.rewardDailyRate ?? c.market.rewardsDailyRate ?? 0,
+			rewardMinSize: c.reward?.rewardMinSize ?? c.market.rewardsMinSize,
+			rewardMaxSpread: c.reward?.rewardMaxSpread ?? c.market.rewardsMaxSpread,
+			book: c.lastBook,
+			volume24h: c.market.volume24hr,
+			liquidity: c.market.liquidity,
+		}));
+	}
 
-	// ---- Live feed (subscribe BOTH outcome tokens so the stacked-arb sees both books).
+	// ---- Live feed.
 	const tokenIds = [...new Set(ctxs.flatMap((c) => (c.noToken ? [c.yesToken, c.noToken] : [c.yesToken])))];
 	const manager = new ParallelWsManager(cfg, tokenIds, {
 		onQuote: (q) => {
@@ -147,23 +210,28 @@ export async function runPaper(cfg: AppConfig): Promise<void> {
 				const ctx = ctxs.find((c) => c.yesToken === q.tokenId || c.noToken === q.tokenId);
 				if (ctx) {
 					const before = paper.snapshot(midpoints).realizedPnl;
-					paper.onTrade(q.tokenId, q.lastTradePrice);
-					const delta = paper.snapshot(midpoints).realizedPnl - before;
+					const fills = paper.onTrade(q.tokenId, q.lastTradePrice);
+					const after = paper.snapshot(midpoints);
+					const delta = after.realizedPnl - before;
 					if (delta !== 0) adverse.addFillPnl(q.tokenId, delta);
+					for (const fill of fills) {
+						void sink.send(formatFillAlert({ fill, question: ctx.market.question, book: latestBooks.get(q.tokenId) ?? ctx.lastBook, netPnl: after.netPnl, unrealizedPnl: after.unrealizedPnl, openOrders: after.openOrders }));
+					}
 				}
 			}
 		},
 		onResolved: (ids) => {
 			for (const id of ids) {
 				paper.cancelAll(id);
-				void sink.send(`🏁 market resolved — cancelled paper orders for ${id.slice(0, 8)}...`);
+				const ctx = ctxs.find((c) => c.yesToken === id || c.noToken === id);
+				void sink.send(`🏁 *Market resolved*\n${ctx?.market.question.slice(0, 100) ?? id}\nCancelled paper orders for token ${id.slice(0, 8)}...`);
 			}
 		},
 	});
 	await manager.start();
 
 	const requote = setInterval(() => {
-		void requoteCycle(cfg, clob, paper, ctxs, midpoints, drift, adverse, settings, sink).catch((e) => log.warn(`requote error: ${(e as Error).message}`));
+		void requoteCycle(cfg, clob, paper, ctxs, midpoints, latestBooks, drift, adverse, settings, sink).catch((e) => log.warn(`requote error: ${(e as Error).message}`));
 	}, REQUOTE_INTERVAL_MS);
 
 	const stats = setInterval(() => {
@@ -191,12 +259,12 @@ async function requoteCycle(
 	paper: PaperEngine,
 	ctxs: MarketCtx[],
 	midpoints: Map<string, number>,
+	latestBooks: Map<string, OrderBookSnapshot>,
 	drift: DriftDetector,
 	adverse: AdverseSelectionMonitor,
 	settings: SettingsStore,
 	sink: AlertSink,
 ): Promise<void> {
-	const totalExposure = netExposureUsd(paper.getPositions(), midpoints);
 	const sharesPerSide = settings.getNum("SIZING.SHARES_PER_SIDE");
 	const offsetFrac = settings.getNum("STRATEGY.OFFSET_FRAC");
 	const maxSingle = settings.getNum("RISK.MAX_SINGLE_MARKET_USD");
@@ -212,27 +280,30 @@ async function requoteCycle(
 		if (drift.isDrifting(token) || adverse.isToxic(token)) {
 			paper.cancelAll(token);
 			if (ctx.noToken) paper.cancelAll(ctx.noToken);
+			await sink.send(`🛑 *Risk cancel*\n${ctx.market.question.slice(0, 100)}\nReason: ${drift.isDrifting(token) ? "fast drift" : "toxic fills"}\nCancelled YES${ctx.noToken ? " + NO" : ""} paper orders.`);
 			continue;
 		}
 
-		// Inventory exit (maker take-profit) for any holding.
 		const pos = paper.getPosition(token);
 		if (pos) {
 			const exit = buildInventoryExit(pos);
 			if (exit && !paper.getOpenOrders(token).some((o) => o.strategy === "inventory-exit" && o.side === exit.side)) {
-				paper.placeOrder({ tokenId: token, side: exit.side, outcome: exit.outcome, price: exit.price, size: exit.size, strategy: "inventory-exit" });
+				const order = paper.placeOrder({ tokenId: token, side: exit.side, outcome: exit.outcome, price: exit.price, size: exit.size, strategy: "inventory-exit" });
+				await sink.send(formatOrderPlacedAlert({ order, question: ctx.market.question, book: ctx.lastBook, expectedDailyReward: 0, exposureUsd: expectedExposureForOrder(order), balance: paper.getBalance(), openOrders: paper.getOpenOrders().length }));
 			}
 		}
 
-		// Risk gate.
+		const totalExposure = netExposureUsd(paper.getPositions(), midpoints);
 		const marketExposure = pos ? Math.abs(pos.shares) * mid : 0;
 		const gate = canQuote({ marketExposureUsd: marketExposure, totalExposureUsd: totalExposure, balanceUsd: paper.getBalance(), params: { maxSingleMarketUsd: maxSingle, maxTotalExposureUsd: maxTotal } });
 		if (!gate.ok) continue;
 
-		// Estimate competition from the live book.
 		let competitorScore = 0;
+		let book: OrderBookSnapshot | null = null;
 		try {
-			const book = await clob.getOrderBook(token);
+			book = await clob.getOrderBook(token);
+			ctx.lastBook = book;
+			latestBooks.set(token, book);
 			const bids: QuoteOrder[] = book.bids.map((b) => ({ price: b.price, size: b.size }));
 			const asks: QuoteOrder[] = book.asks.map((a) => ({ price: a.price, size: a.size }));
 			competitorScore = scoreSide(bids, mid).qScore + scoreSide(asks, mid).qScore;
@@ -240,106 +311,91 @@ async function requoteCycle(
 			/* tolerate book read failure */
 		}
 
-		// Pick the best enabled strategy for this market.
 		const out: StrategyOutput | null = selectStrategy(
-			{ midpoint: mid, yesTokenId: token, rewardPool: ctx.market.rewardsDailyRate ?? 0, competitorScore, sharesPerSide, hoursToResolution: hoursToResolution(ctx.market), offsetFrac },
+			{ midpoint: mid, yesTokenId: token, rewardPool: ctx.reward?.rewardDailyRate ?? ctx.market.rewardsDailyRate ?? 0, competitorScore, sharesPerSide, hoursToResolution: hoursToResolution(ctx.market), offsetFrac },
 			settings,
 		);
 		if (!out) {
-			// Keep inventory-exit and stacked-arb orders; clear plain quotes only.
 			for (const o of paper.getOpenOrders(token)) if (o.strategy !== "inventory-exit" && o.strategy !== "stacked-arb") paper.cancelOrder(o.id);
 		} else {
-			// Reconcile against current strategy quotes.
 			const current = paper.getOpenOrders(token).filter((o) => o.strategy === out.strategy);
 			const { toCancel, toPlace } = reconcileQuotes({ desired: out.orders, current, repriceTolerance: REPRICE_TOLERANCE });
-			// Cancel quotes from a different (switched) strategy too — but never inventory-exit or stacked-arb.
 			for (const o of paper.getOpenOrders(token)) if (o.strategy !== out.strategy && o.strategy !== "inventory-exit" && o.strategy !== "stacked-arb") paper.cancelOrder(o.id);
 			for (const id of toCancel) paper.cancelOrder(id);
-			for (const d of toPlace) paper.placeOrder({ tokenId: token, side: d.side, outcome: d.outcome, price: d.price, size: d.size, strategy: out.strategy });
+			for (const d of toPlace) {
+				const order = paper.placeOrder({ tokenId: token, side: d.side, outcome: d.outcome, price: d.price, size: d.size, strategy: out.strategy });
+				if (settings.getBool("ALERTS.ENABLED")) await sink.send(formatOrderPlacedAlert({ order, question: ctx.market.question, book, expectedDailyReward: out.expectedDailyReward, exposureUsd: marketExposure + expectedExposureForOrder(order), balance: paper.getBalance(), openOrders: paper.getOpenOrders().length }));
+			}
 
-			// Accrue calibrated reward for this cycle.
-			if ((ctx.market.rewardsDailyRate ?? 0) > 0) {
+			if ((ctx.reward?.rewardDailyRate ?? ctx.market.rewardsDailyRate ?? 0) > 0) {
 				const cycleReward = (out.expectedDailyReward * REQUOTE_INTERVAL_MS) / 86_400_000;
 				paper.accrueReward(cycleReward);
 				adverse.addReward(token, cycleReward);
 			}
 
-			// Per-strategy alert (throttled, named, with expected reward).
 			const now = Date.now();
 			const changed = ctx.lastAlertStrategy !== out.strategy;
 			if (settings.getBool("ALERTS.ENABLED") && (changed || now - ctx.lastAlertAt >= minAlertMs) && toPlace.length > 0) {
 				ctx.lastAlertStrategy = out.strategy;
 				ctx.lastAlertAt = now;
-				void sink.send(
-					formatStrategyAlert({
-						strategy: out.strategy,
-						question: ctx.market.question,
-						action: changed ? "engaged" : "requoted",
-						expectedDailyReward: out.expectedDailyReward,
-						midpoint: mid,
-						score10: ctx.scored.score10,
-					}),
-				);
+				await sink.send(formatStrategyAlert({ strategy: out.strategy, question: ctx.market.question, action: changed ? "engaged" : "requoted", expectedDailyReward: out.expectedDailyReward, midpoint: mid, score10: ctx.scored.score10, book, exposureUsd: marketExposure, balance: paper.getBalance() }));
 			}
 		}
 
-		// Cross-outcome stacked-arb (optional, resting maker on BOTH legs).
 		if (settings.getBool("STRATEGY.ENABLE_STACKED_ARB") && ctx.noToken) {
-			await manageStackedArb(clob, paper, ctx, settings, sink, minAlertMs);
+			await manageStackedArb(clob, paper, ctx, latestBooks, settings, sink, minAlertMs);
 		}
 	}
 }
 
-// Maintain a resting YES+NO maker pair whose prices sum to < 1 (locked arb edge
-// stacked on top of the maker reward). Cancels stale arb orders when no edge exists.
 async function manageStackedArb(
 	clob: ClobRestClient,
 	paper: PaperEngine,
 	ctx: MarketCtx,
+	latestBooks: Map<string, OrderBookSnapshot>,
 	settings: SettingsStore,
 	sink: AlertSink,
 	minAlertMs: number,
 ): Promise<void> {
 	const yesToken = ctx.yesToken;
 	const noToken = ctx.noToken!;
-	let yesBook;
-	let noBook;
+	let yesBook: OrderBookSnapshot;
+	let noBook: OrderBookSnapshot;
 	try {
 		yesBook = await clob.getOrderBook(yesToken);
 		noBook = await clob.getOrderBook(noToken);
+		latestBooks.set(yesToken, yesBook);
+		latestBooks.set(noToken, noBook);
+		ctx.lastBook = yesBook;
 	} catch {
 		return;
 	}
 	const yes: ArbBook = { bestBid: yesBook.bids[0]?.price ?? 0, bestAsk: yesBook.asks[0]?.price ?? 1 };
 	const no: ArbBook = { bestBid: noBook.bids[0]?.price ?? 0, bestAsk: noBook.asks[0]?.price ?? 1 };
 
-	const quote = buildStackedArb({
-		yes,
-		no,
-		params: { minEdge: settings.getNum("STRATEGY.ARB_MIN_EDGE"), sharesPerSide: settings.getNum("STRATEGY.ARB_SHARES_PER_SIDE") },
-	});
-
+	const quote = buildStackedArb({ yes, no, params: { minEdge: settings.getNum("STRATEGY.ARB_MIN_EDGE"), sharesPerSide: settings.getNum("STRATEGY.ARB_SHARES_PER_SIDE") } });
 	if (!quote) {
 		for (const o of paper.getOpenOrders(yesToken)) if (o.strategy === "stacked-arb") paper.cancelOrder(o.id);
 		for (const o of paper.getOpenOrders(noToken)) if (o.strategy === "stacked-arb") paper.cancelOrder(o.id);
 		return;
 	}
 
-	const yesCurrent = paper.getOpenOrders(yesToken).filter((o) => o.strategy === "stacked-arb");
-	const yesRecon = reconcileQuotes({ desired: [quote.yesOrder], current: yesCurrent, repriceTolerance: REPRICE_TOLERANCE });
+	const placed: ManagedOrder[] = [];
+	const yesRecon = reconcileQuotes({ desired: [quote.yesOrder], current: paper.getOpenOrders(yesToken).filter((o) => o.strategy === "stacked-arb"), repriceTolerance: REPRICE_TOLERANCE });
 	for (const id of yesRecon.toCancel) paper.cancelOrder(id);
-	for (const d of yesRecon.toPlace) paper.placeOrder({ tokenId: yesToken, side: d.side, outcome: d.outcome, price: d.price, size: d.size, strategy: "stacked-arb" });
+	for (const d of yesRecon.toPlace) placed.push(paper.placeOrder({ tokenId: yesToken, side: d.side, outcome: d.outcome, price: d.price, size: d.size, strategy: "stacked-arb" }));
 
-	const noCurrent = paper.getOpenOrders(noToken).filter((o) => o.strategy === "stacked-arb");
-	const noRecon = reconcileQuotes({ desired: [quote.noOrder], current: noCurrent, repriceTolerance: REPRICE_TOLERANCE });
+	const noRecon = reconcileQuotes({ desired: [quote.noOrder], current: paper.getOpenOrders(noToken).filter((o) => o.strategy === "stacked-arb"), repriceTolerance: REPRICE_TOLERANCE });
 	for (const id of noRecon.toCancel) paper.cancelOrder(id);
-	for (const d of noRecon.toPlace) paper.placeOrder({ tokenId: noToken, side: d.side, outcome: d.outcome, price: d.price, size: d.size, strategy: "stacked-arb" });
+	for (const d of noRecon.toPlace) placed.push(paper.placeOrder({ tokenId: noToken, side: d.side, outcome: d.outcome, price: d.price, size: d.size, strategy: "stacked-arb" }));
+
+	for (const order of placed) {
+		await sink.send(formatOrderPlacedAlert({ order, question: ctx.market.question, book: order.tokenId === yesToken ? yesBook : noBook, expectedDailyReward: ctx.reward?.rewardDailyRate ?? ctx.market.rewardsDailyRate ?? 0, exposureUsd: expectedExposureForOrder(order), balance: paper.getBalance(), openOrders: paper.getOpenOrders().length }));
+	}
 
 	const now = Date.now();
-	if (settings.getBool("ALERTS.ENABLED") && now - ctx.lastArbAlertAt >= minAlertMs && yesRecon.toPlace.length + noRecon.toPlace.length > 0) {
+	if (settings.getBool("ALERTS.ENABLED") && now - ctx.lastArbAlertAt >= minAlertMs && placed.length > 0) {
 		ctx.lastArbAlertAt = now;
-		void sink.send(
-			`🎯 stacked-arb — ${ctx.market.question.slice(0, 50)}\nYES ${quote.yesOrder.price.toFixed(2)} + NO ${quote.noOrder.price.toFixed(2)} -> locked ${(quote.edge * 100).toFixed(1)}¢/share (+ maker reward)`,
-		);
+		await sink.send(`🎯 *stacked-arb active*\n${ctx.market.question.slice(0, 95)}\nYES ${quote.yesOrder.price.toFixed(3)} + NO ${quote.noOrder.price.toFixed(3)} = ${(quote.yesOrder.price + quote.noOrder.price).toFixed(3)}\nLocked edge ${(quote.edge * 100).toFixed(1)}¢/matched share + maker reward.`);
 	}
 }

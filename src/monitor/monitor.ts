@@ -1,6 +1,6 @@
 // Lightweight monitor: periodic PnL push + drawdown alerting.
 import type { AlertSink } from "../telegram/alerts.js";
-import { formatPnlAlert } from "../telegram/alerts.js";
+import { formatPnlAlert, formatDrawdownAlert } from "../telegram/alerts.js";
 import type { PnlSnapshot } from "../paper/paperEngine.js";
 import { createLogger } from "../core/logger.js";
 
@@ -24,7 +24,7 @@ export class Monitor {
 		const drawdown = this.peakNet - s.netPnl;
 		if (drawdown >= this.drawdownAlertUsd) {
 			log.warn(`drawdown $${drawdown.toFixed(2)} from peak $${this.peakNet.toFixed(2)}`);
-			await this.sink.send(`⚠️ drawdown $${drawdown.toFixed(2)} from peak (net now $${s.netPnl.toFixed(2)})`);
+			await this.sink.send(formatDrawdownAlert({ drawdown, peakNet: this.peakNet, snapshot: s }));
 		}
 		const now = Date.now();
 		if (push && now - this.lastAlertAt >= this.minAlertIntervalMs) {
