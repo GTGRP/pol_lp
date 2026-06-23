@@ -19,7 +19,7 @@ import { SettingsStore } from "../telegram/settingsStore.js";
 import { TelegramBot } from "../telegram/bot.js";
 import { NoopAlertSink, formatStrategyAlert, formatPnlAlert, type AlertSink } from "../telegram/alerts.js";
 import { Monitor } from "../monitor/monitor.js";
-import { selectTopMarkets, metricsFromBook, type MarketMetrics, type ScoredMarket } from "../select/marketSelector.js";
+import { selectTopMarkets, compositeScore, metricsFromBook, type MarketMetrics, type ScoredMarket } from "../select/marketSelector.js";
 import type { GammaMarket } from "../core/types.js";
 
 const log = createLogger("paper-runner");
@@ -106,7 +106,16 @@ export async function runPaper(cfg: AppConfig): Promise<void> {
 
 	const actScore = settings.getNum("SELECTION.ACT_SCORE");
 	const maxMarkets = settings.getNum("SELECTION.MAX_MARKETS");
-	const selected = selectTopMarkets(metrics, actScore, maxMarkets);
+	let selected = selectTopMarkets(metrics, actScore, maxMarkets);
+	if (selected.length === 0 && metrics.length > 0) {
+		selected = metrics
+			.map((m) => ({ ...m, ...compositeScore(m) }))
+			.sort((a, b) => b.score10 - a.score10)
+			.slice(0, maxMarkets);
+		const best = selected[0]?.score10 ?? 0;
+		log.warn(`no markets scored >= ${actScore}; fallback farming best available (${best.toFixed(1)}/10). Lower SELECTION.ACT_SCORE if you want this always.`);
+		await sink.send(`⚠️ no markets scored >= ${actScore}/10 — paper fallback farming best available (${best.toFixed(1)}/10)`);
+	}
 	const ctxs: MarketCtx[] = selected.map((s) => {
 		const m = byToken.get(s.tokenId)!;
 		return {
@@ -121,8 +130,8 @@ export async function runPaper(cfg: AppConfig): Promise<void> {
 	});
 
 	if (ctxs.length === 0) {
-		log.error(`no markets scored >= ${actScore}; nothing to farm`);
-		await sink.send(`⚠️ no markets scored >= ${actScore}/10 right now`);
+		log.error("no readable tradable markets found; nothing to farm");
+		await sink.send("⚠️ no readable tradable markets found right now");
 		return;
 	}
 	for (const c of ctxs) log.info(`farming [${c.scored.score10.toFixed(1)}/10] ${c.market.question.slice(0, 56)}`);
