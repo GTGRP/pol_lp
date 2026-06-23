@@ -50,6 +50,12 @@ export interface AppConfig {
 	telegramChatId: string;
 	// ops
 	enableAutoRedeem: boolean;
+	// gasless redeem (Polymarket relayer + builder program)
+	gaslessRedeem: boolean;
+	relayerUrl: string;
+	builderApiKey: string;
+	builderApiSecret: string;
+	builderApiPassphrase: string;
 	// logging
 	logLevel: string;
 	debugRejectedTicks: boolean;
@@ -84,6 +90,11 @@ export function loadConfig(): AppConfig {
 		telegramBotToken: str("TELEGRAM_BOT_TOKEN"),
 		telegramChatId: str("TELEGRAM_CHAT_ID"),
 		enableAutoRedeem: bool("ENABLE_AUTO_REDEEM", false),
+		gaslessRedeem: bool("GASLESS_REDEEM", false),
+		relayerUrl: str("RELAYER_URL", "https://relayer-v2.polymarket.com"),
+		builderApiKey: str("POLY_BUILDER_API_KEY"),
+		builderApiSecret: str("POLY_BUILDER_API_SECRET"),
+		builderApiPassphrase: str("POLY_BUILDER_API_PASSPHRASE"),
 		logLevel: str("LOG_LEVEL", "info"),
 		debugRejectedTicks: bool("DEBUG_REJECTED_TICKS", false),
 	};

@@ -10,6 +10,7 @@ import { ParallelWsManager } from "../ws/parallelWsManager.js";
 import { PaperEngine } from "../paper/paperEngine.js";
 import { LiveClient } from "../live/liveClient.js";
 import { Reconciler } from "../live/reconciler.js";
+import { redeemResolved } from "../redeem/autoRedeem.js";
 import { buildQuotes, reconcileQuotes, canQuote, DriftDetector } from "../strategy/index.js";
 
 const log = createLogger("live-runner");
@@ -51,6 +52,24 @@ export async function runLive(cfg: AppConfig): Promise<void> {
 				await live.cancelAll();
 			} catch (e) {
 				log.warn(`cancelAll on resolve failed: ${(e as Error).message}`);
+			}
+			// Auto-redeem the resolved market's winning tokens (gasless if configured).
+			if (cfg.enableAutoRedeem) {
+				const conditionId = (market as any).conditionId ?? (market as any).condition_id;
+				if (conditionId) {
+					try {
+						const hash = await redeemResolved(cfg, {
+							conditionId,
+							rpcUrl: cfg.rpcUrl,
+							negRisk: Boolean((market as any).negRisk ?? (market as any).neg_risk),
+						});
+						log.info(`auto-redeem submitted: ${hash}`);
+					} catch (e) {
+						log.warn(`auto-redeem failed: ${(e as Error).message}`);
+					}
+				} else {
+					log.warn("auto-redeem skipped: market has no conditionId");
+				}
 			}
 		},
 	});
