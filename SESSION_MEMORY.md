@@ -38,19 +38,33 @@
 
 ## 2026-06-23 19:02 IST — Phase 3: Live Executor
 
+**What was done** live/auth (L1 EIP-712 ClobAuth + deriveOrCreateApiKey, EOA-signed so sig-type-3 safe); live/orderSigning (CTF Exchange EIP-712 order; 6-dec maker/taker; sig type 3 maker=funder, signer=EOA; GTC; std vs neg-risk addresses isolated); live/rateLimiter (token bucket); live/liveClient (sign+POST /order GTC, /order/cancel, /cancel-all; per-order USD cap; 429 backoff); live/reconciler (shadow paper vs live fill-rate + PnL delta); run/liveRunner (gated, single-market, reuses same quoter/risk/drift; cancel-all on resolve+shutdown); main routes live; config+env LIVE_MAX_ORDER_USD.
+**Why** Live reuses identical strategy/risk code (no divergence); dangerous unknowns isolated + capped to validate with a $1 order first.
+**Safety** opt-in TRADING_MODE=live, hard per-order cap, cancel-all on resolve/shutdown. Exchange addresses + /order payload flagged to verify against live API before real use.
+**Findings** L1 auth is EOA-signed regardless of sig type; only order signing needs the funder binding for POLY_1271. Shadow paper engine in live mode gives a free continuous accuracy check.
+**Next** Phase 4.
+
+---
+
+## 2026-06-23 19:21 IST — Phase 4: Scale + Control Panel (FINAL)
+
 **What was done**
-- Merged Phase 2 to `main`; branched `phase-3-live-executor`.
-- `src/live/auth.ts` — L1 EIP-712 ClobAuth signing + `deriveOrCreateApiKey` (derive existing L2 creds, else create). Works for sig type 3 since L1 is always EOA-signed.
-- `src/live/orderSigning.ts` — CTF Exchange EIP-712 Order builder + signer: 6-decimal maker/taker amounts, BUY/SELL, **sig type 3 maps maker=funder/deposit wallet, signer=EOA**, GTC (expiration 0), standard vs neg-risk exchange addresses isolated for verification.
-- `src/live/rateLimiter.ts` — token-bucket limiter.
-- `src/live/liveClient.ts` — init/derive creds, sign+POST `/order` (GTC), `/order/cancel`, `/cancel-all`; **per-order notional cap** (`LIVE_MAX_ORDER_USD`, default $10); 429 backoff.
-- `src/live/reconciler.ts` — shadow PaperEngine vs live: fill-rate error + PnL delta, feeding model convergence.
-- `src/run/liveRunner.ts` — gated live loop reusing the SAME quoter/risk/drift logic; single-market start; cancels all on resolve + shutdown. `main.ts` routes live mode here; added `LIVE_MAX_ORDER_USD` to config + `.env.example`.
+- Merged Phase 3 to `main`; branched `phase-4-scale-telegram`.
+- `src/select/marketSelector.ts` — composite 0–10 scoring (spread .30 / reward-sanity .22 / depth .20 / volume .13 / centrality .15) + sports boost; `selectTopMarkets` keeps only >= act score (default 7) and top N; `metricsFromBook` derives spread/depth/midpoint from the live book.
+- `src/strategy/strategies.ts` — strategy registry: **core-maker** (tight two-sided in-band) + **grid-lp** (wider hedged grid for <= 1-week markets); `selectStrategy` picks the highest expected-reward enabled+applicable strategy; each output carries strategy name + expected daily reward.
+- `src/telegram/settingsStore.ts` — WEATHERPOL-style typed BOOL/NUM/STR settings grouped into tabs (STRATEGY/RISK/SIZING/SELECTION/ALERTS), JSON-persisted, validated/coerced; read live by the runner so changes apply without restart.
+- `src/telegram/alerts.ts` — AlertSink + formatters; **every strategy alert names the strategy and its expected daily reward**.
+- `src/telegram/bot.ts` — control panel over the Bot API (no deps): /status /pnl /settings [group] /set KEY VALUE /pause /resume /help.
+- `src/monitor/monitor.ts` — periodic PnL push + drawdown alerting.
+- `src/redeem/autoRedeem.ts` — CTF redeemPositions for resolved markets (gated; addresses flagged to verify).
+- Rewrote `src/run/paperRunner.ts` to wire selection + strategy registry + settings + Telegram alerts + monitor. Config+env gain TELEGRAM_BOT_TOKEN/CHAT_ID, RPC_URL, ENABLE_AUTO_REDEEM.
 
-**Why** Live must reuse the identical strategy/risk code exercised in paper (no divergence), and every dangerous unknown (exchange addresses, payload shape) is isolated + capped so it can be validated with a $1 order before scaling.
+**Why** This delivers the requested control surface: multiple named strategies, Telegram alerts that say which strategy acted and the expected return, runtime-adjustable settings (balance/sizing/risk/selection) mirroring the WEATHERPOL panel, and disciplined market selection so we only farm high-quality opportunities (maximize returns, avoid bad fills).
 
-**Safety** Live is opt-in (`TRADING_MODE=live`), hard per-order USD cap, cancel-all on resolution and shutdown, starts on one market. Exchange addresses + `/order` payload shape flagged for verification against the live API before real use.
+**Findings** Reading settings live each cycle is the cleanest way to get WEATHERPOL-style runtime control without IPC. Composite scoring naturally down-weights tail/illiquid markets (low centrality/depth), which is exactly where adverse selection bites.
 
-**Findings** L1 auth is EOA-signed regardless of signature type; only order signing needs the funder binding for POLY_1271. Keeping a shadow paper engine in live mode gives a free, continuous accuracy check of the paper model.
+**Status** All 4 phases complete and merged to `main`. Paper mode is fully runnable end-to-end against live Polymarket data; live mode is implemented behind explicit opt-in + caps.
 
-**Next (Phase 4)** Scale + harden: multi-market scoring/selection engine (act on 7+/10), Telegram control panel (port WEATHERPOL settings_store + telegram_ui: runtime-adjustable settings + per-strategy alerts naming strategy & expected reward), monitoring, auto-redeem.
+**Verify-before-live checklist** (1) CTF + neg-risk exchange addresses & /order payload shape, (2) auto-redeem conditionId/indexSets on one position, (3) run paper for a sustained period and watch the reconciler before funding live.
+
+**Next / backlog** Wire neg-risk detection per market into live order signing; add the cross-outcome stacked-arb strategy (needs both YES+NO books subscribed); calibrator feedback loop from the live reconciler into reward estimates.
