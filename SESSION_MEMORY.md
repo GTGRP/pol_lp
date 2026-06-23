@@ -38,3 +38,27 @@
 
 **Next steps (Phase 1)**
 - Implement `rewards/scorer.ts` (replicate Qn: quadratic spread penalty, size cutoff, two-sided bonus), `rewards/estimator.ts` ($/day given a quote config + competition), and `rewards/calibrator.ts` (poll order-scoring + per-user reward % to tune the estimator against reality).
+
+---
+
+## 2026-06-23 18:22 IST — Phase 1: Reward Brain
+
+**What was done**
+- Merged Phase 0 into `main` (squash) and branched `phase-1-reward-brain`.
+- Added the reward brain under `src/rewards/`:
+  - `scorer.ts` — replicates Polymarket's liquidity-rewards scoring ("Qn"): quadratic spread decay `((maxSpread - spread)/maxSpread)^b`, `maxSpread` cutoff, `minSize` cutoff, and a **two-sided binding score** = `min(qBid, qAsk)` so lopsided books earn ~nothing. Every constant is configurable.
+  - `estimator.ts` — converts a score into expected USDC/day via `pool * myScore / (competitorScore + myScore)`, plus capital-at-risk, daily return %, and naive APR. Models diminishing returns from over-sizing and crowding.
+  - `calibrator.ts` — EMA calibration factor that reconciles our estimates against the **real** authenticated endpoints (`getUserRewardsEarnings`, `getOrderScoring`), clamped to [0.2, 5], pulling the model toward ~99% of real behaviour.
+  - `index.ts` — public surface for the reward brain.
+
+**Why we did it this way**
+- The whole edge of LP farming is: *quote as tightly and two-sided as possible without getting adversely filled*. The scorer makes “tightness” and “two-sidedness” first-class, quantified signals the strategy layer (Phase 2) can optimize against.
+- We deliberately treat the formula as a **model + calibrator** rather than hard-coding Polymarket’s exact constants, because those constants change and per-market configs vary. Calibration keeps us honest against reality.
+- `min(qBid, qAsk)` as the reward-binding score encodes the real two-sided requirement and discourages the strategy from farming one side only.
+
+**Findings**
+- Reward share is a fraction of the pool, so beyond a point adding size mostly cannibalizes our own share — the estimator surfaces this so sizing logic (Phase 2) won’t over-commit capital.
+- Order-scoring endpoint lets us confirm in real time whether a resting order is actually qualifying — this becomes a live guardrail in Phase 2/3.
+
+**Next steps (Phase 2)**
+- Paper engine: `quoter` (places two-sided orders inside the reward band using the scorer/estimator), `inventoryManager`, `riskGuard`, and a `crossing-fill simulator` that fills our resting orders when real trades cross their price (using the live WS feed), with full PnL/fees/gas accounting so paper tracks live to ~99%.
