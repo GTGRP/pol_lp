@@ -57,8 +57,9 @@ export function scoreOrder(spread: number, size: number, params: ScoringParams):
 	return weight * size * params.inGameMultiplier;
 }
 
-// Score one side of the book against a midpoint.
-export function scoreSide(orders: QuoteOrder[], midpoint: number, params: ScoringParams): SideScore {
+// Score one side of the book against a midpoint. Defaults to DEFAULT_SCORING so
+// callers that just need the current baseline competitor estimate can pass two args.
+export function scoreSide(orders: QuoteOrder[], midpoint: number, params: ScoringParams = DEFAULT_SCORING): SideScore {
 	let qScore = 0;
 	let qualifyingSize = 0;
 	let count = 0;
