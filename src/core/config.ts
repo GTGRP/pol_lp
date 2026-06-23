@@ -38,6 +38,7 @@ export interface AppConfig {
 	startingBalance: number;
 	maxSingleMarketUsd: number;
 	defaultSharesPerSide: number;
+	liveMaxOrderUsd: number;
 	// ws tuning
 	wsParallelConnections: number;
 	wsPruneIntervalSec: number;
@@ -68,6 +69,7 @@ export function loadConfig(): AppConfig {
 		startingBalance: num("STARTING_BALANCE", 100),
 		maxSingleMarketUsd: num("MAX_SINGLE_MARKET_USD", 40),
 		defaultSharesPerSide: num("DEFAULT_SHARES_PER_SIDE", 75),
+		liveMaxOrderUsd: num("LIVE_MAX_ORDER_USD", 10),
 		wsParallelConnections: num("WS_PARALLEL_CONNECTIONS", 3),
 		wsPruneIntervalSec: num("WS_PRUNE_INTERVAL_SEC", 30),
 		wsMaxPriceJump: num("WS_MAX_PRICE_JUMP", 0.15),
