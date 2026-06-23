@@ -1,8 +1,8 @@
 // Runtime settings store (WEATHERPOL-style).
 //
-// Typed BOOL/NUM/STR keys grouped into tabs, with defaults, JSON persistence, and
-// validation/coercion on set. Telegram commands edit these live, so the running
-// bot reacts to changes without a restart.
+// Typed BOOL/NUM/STR keys grouped into tabs, with defaults, JSON persistence, env
+// overrides, and validation/coercion on set. Telegram commands edit these live, so
+// the running bot reacts to changes without a restart.
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { createLogger } from "../core/logger.js";
 
@@ -42,6 +42,10 @@ export const SETTING_DEFS: SettingDef[] = [
 	{ key: "ALERTS.MIN_INTERVAL_SEC", type: "NUM", default: 60, group: "ALERTS", label: "Min seconds between same alert" },
 ];
 
+function envKeyForSetting(key: string): string {
+	return key.replace(/\./g, "_");
+}
+
 function coerce(def: SettingDef, raw: string | SettingValue): SettingValue {
 	if (def.type === "BOOL") {
 		if (typeof raw === "boolean") return raw;
@@ -67,6 +71,7 @@ export class SettingsStore {
 			this.values.set(d.key, d.default);
 		}
 		this.load();
+		this.applyEnvOverrides();
 	}
 
 	private load(): void {
@@ -80,6 +85,21 @@ export class SettingsStore {
 			log.info(`loaded settings from ${this.path}`);
 		} catch (e) {
 			log.warn(`failed to load settings: ${(e as Error).message}`);
+		}
+	}
+
+	private applyEnvOverrides(): void {
+		for (const def of SETTING_DEFS) {
+			const envKey = envKeyForSetting(def.key);
+			const raw = process.env[envKey];
+			if (raw === undefined || raw === "") continue;
+			try {
+				const value = coerce(def, raw);
+				this.values.set(def.key, value);
+				log.info(`env override ${envKey} -> ${def.key} = ${value}`);
+			} catch (e) {
+				log.warn(`invalid env override ${envKey}: ${(e as Error).message}`);
+			}
 		}
 	}
 
