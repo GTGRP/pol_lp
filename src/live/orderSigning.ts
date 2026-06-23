@@ -1,28 +1,30 @@
 // CLOB order construction + EIP-712 signing.
 //
-// Builds a Polymarket CTF Exchange order, computes maker/taker amounts (USDC and
-// shares are 6-decimal fixed point), and signs it with the EOA. For signature
+// Builds a Polymarket CTF Exchange (V2) order, computes maker/taker amounts (pUSD
+// and shares are 6-decimal fixed point), and signs it with the EOA. For signature
 // type 3 (POLY_1271) the `maker` is the funder/deposit wallet while the `signer`
 // is the controlling EOA.
 //
-// !! VERIFY BEFORE LIVE TRADING !!
-//   - Exchange verifyingContract addresses (standard vs neg-risk markets).
-//   - Exact /order POST payload shape expected by the current CLOB API.
-// These are isolated here and in liveClient.ts so they can be confirmed against a
-// $1 test order before scaling.
+// Exchange addresses come from core/contracts.ts (V2, docs-verified). Still confirm
+// the exact /order POST payload shape + EIP-712 domain (name/version) against the
+// live CLOB V2 API with a $1 test order before scaling — the V2 order struct may
+// differ from V1; that surface is isolated in liveClient.ts.
 import { Wallet, getAddress } from "ethers";
+import { POLYMARKET_V2 } from "../core/contracts.js";
 
 export type OrderSide = "BUY" | "SELL";
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
-const SCALE = 1_000_000; // 1e6 fixed point for USDC and shares
+const SCALE = 1_000_000; // 1e6 fixed point for collateral (pUSD) and shares
 
-// Polygon mainnet exchange addresses (verify before live use).
-export const CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
-export const NEG_RISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+// V2 Polygon exchange addresses (see core/contracts.ts).
+export const CTF_EXCHANGE = POLYMARKET_V2.ctfExchange;
+export const NEG_RISK_CTF_EXCHANGE = POLYMARKET_V2.negRiskCtfExchange;
 
 function exchangeDomain(chainId: number, verifyingContract: string) {
-	return { name: "Polymarket CTF Exchange", version: "1", chainId, verifyingContract: getAddress(verifyingContract) };
+	// Lowercase first so getAddress re-derives the checksum (avoids a throw on any
+	// checksum-casing mismatch in the source address string).
+	return { name: "Polymarket CTF Exchange", version: "1", chainId, verifyingContract: getAddress(verifyingContract.toLowerCase()) };
 }
 
 const ORDER_TYPES = {
@@ -79,7 +81,6 @@ function computeAmounts(side: OrderSide, price: number, size: number): { makerAm
 }
 
 function randomSalt(): bigint {
-	// 64-bit random salt is plenty for uniqueness.
 	const hi = BigInt(Math.floor(Math.random() * 0xffffffff));
 	const lo = BigInt(Math.floor(Math.random() * 0xffffffff));
 	return (hi << 32n) | lo;

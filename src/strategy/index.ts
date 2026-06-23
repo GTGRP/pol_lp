@@ -21,3 +21,10 @@ export {
 	DEFAULT_RISK_PARAMS,
 	type RiskParams,
 } from "./riskGuard.js";
+export {
+	buildStackedArb,
+	DEFAULT_STACKED_ARB_PARAMS,
+	type ArbBook,
+	type StackedArbParams,
+	type StackedArbQuote,
+} from "./stackedArb.js";

@@ -24,6 +24,9 @@ export const SETTING_DEFS: SettingDef[] = [
 	{ key: "STRATEGY.ENABLED", type: "BOOL", default: true, group: "STRATEGY", label: "Master strategy on/off" },
 	{ key: "STRATEGY.ENABLE_CORE_MAKER", type: "BOOL", default: true, group: "STRATEGY", label: "Enable core-maker" },
 	{ key: "STRATEGY.ENABLE_GRID_LP", type: "BOOL", default: true, group: "STRATEGY", label: "Enable grid-lp" },
+	{ key: "STRATEGY.ENABLE_STACKED_ARB", type: "BOOL", default: false, group: "STRATEGY", label: "Enable stacked YES+NO<1 arb" },
+	{ key: "STRATEGY.ARB_MIN_EDGE", type: "NUM", default: 0.02, group: "STRATEGY", label: "Min locked edge (1-pYes-pNo)" },
+	{ key: "STRATEGY.ARB_SHARES_PER_SIDE", type: "NUM", default: 50, group: "STRATEGY", label: "Arb shares per leg" },
 	{ key: "STRATEGY.OFFSET_FRAC", type: "NUM", default: 0.5, group: "STRATEGY", label: "Quote offset as fraction of band" },
 	// RISK
 	{ key: "RISK.MAX_SINGLE_MARKET_USD", type: "NUM", default: 40, group: "RISK", label: "Max exposure per market" },
