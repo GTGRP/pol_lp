@@ -34,6 +34,7 @@ export interface AppConfig {
 	clobWsUrl: string;
 	gammaUrl: string;
 	chainId: number;
+	rpcUrl: string;
 	// capital
 	startingBalance: number;
 	maxSingleMarketUsd: number;
@@ -44,6 +45,11 @@ export interface AppConfig {
 	wsPruneIntervalSec: number;
 	wsMaxPriceJump: number;
 	wsMinWarmupTicks: number;
+	// telegram
+	telegramBotToken: string;
+	telegramChatId: string;
+	// ops
+	enableAutoRedeem: boolean;
 	// logging
 	logLevel: string;
 	debugRejectedTicks: boolean;
@@ -66,6 +72,7 @@ export function loadConfig(): AppConfig {
 		),
 		gammaUrl: str("GAMMA_URL", "https://gamma-api.polymarket.com"),
 		chainId: num("CHAIN_ID", 137),
+		rpcUrl: str("RPC_URL", "https://polygon-rpc.com"),
 		startingBalance: num("STARTING_BALANCE", 100),
 		maxSingleMarketUsd: num("MAX_SINGLE_MARKET_USD", 40),
 		defaultSharesPerSide: num("DEFAULT_SHARES_PER_SIDE", 75),
@@ -74,6 +81,9 @@ export function loadConfig(): AppConfig {
 		wsPruneIntervalSec: num("WS_PRUNE_INTERVAL_SEC", 30),
 		wsMaxPriceJump: num("WS_MAX_PRICE_JUMP", 0.15),
 		wsMinWarmupTicks: num("WS_MIN_WARMUP_TICKS", 3),
+		telegramBotToken: str("TELEGRAM_BOT_TOKEN"),
+		telegramChatId: str("TELEGRAM_CHAT_ID"),
+		enableAutoRedeem: bool("ENABLE_AUTO_REDEEM", false),
 		logLevel: str("LOG_LEVEL", "info"),
 		debugRejectedTicks: bool("DEBUG_REJECTED_TICKS", false),
 	};
