@@ -33,7 +33,7 @@ export interface RewardConfig {
 	maxIncentiveSpread: number | null;
 	// Minimum qualifying order size (shares).
 	minIncentiveSize: number | null;
-	// Daily reward pool for the market in USDC.
+	// Daily reward pool for the market in pUSD/USDC terms.
 	dailyRewardPool: number | null;
 }
 
@@ -47,6 +47,10 @@ export interface GammaMarket {
 	endDateIso?: string;
 	active: boolean;
 	closed: boolean;
+	archived?: boolean;
+	acceptingOrders?: boolean;
+	enableOrderBook?: boolean;
+	negRisk?: boolean;
 	volume24hr: number | null;
 	liquidity: number | null;
 	// CLOB token ids: typically [yesTokenId, noTokenId].

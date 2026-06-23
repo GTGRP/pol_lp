@@ -1,9 +1,8 @@
 // Paper trading engine.
 //
-// Mirrors a real Polymarket account using live data: holds USDC balance,
-// positions (with average cost), and open maker orders; applies crossing fills
-// from real trade prints; tracks realized/unrealized PnL, fees, gas, and accrued
-// LP rewards. The goal is for paper PnL to track live farming to ~99%.
+// Mirrors a real Polymarket account using live data: holds pUSD/USDC-like balance,
+// positions (with average cost), and open maker orders; applies crossing fills from
+// real trade prints; tracks realized/unrealized PnL, fees, gas, and accrued LP rewards.
 import type { ManagedOrder, Position, Side, Outcome } from "../core/types.js";
 import { DEFAULT_FEES, tradeFee, type FeeModel } from "../core/fees.js";
 import { simulateTradeCrossing } from "./fillSimulator.js";
@@ -15,7 +14,6 @@ const EPS = 1e-9;
 export interface PaperConfig {
 	startingBalance: number;
 	fees?: FeeModel;
-	// When a trade print has no size, fill the crossed order fully (approximation).
 	fillUnknownSizeFully?: boolean;
 }
 
@@ -29,6 +27,22 @@ export interface PnlSnapshot {
 	netPnl: number;
 	openOrders: number;
 	positions: Position[];
+}
+
+export interface PaperFillReport {
+	orderId: string;
+	tokenId: string;
+	side: Side;
+	outcome: Outcome;
+	price: number;
+	size: number;
+	notional: number;
+	fee: number;
+	strategy: string;
+	remainingSize: number;
+	balanceAfter: number;
+	positionAfter: Position | null;
+	status: "filled" | "partial";
 }
 
 export interface PlaceArgs {
@@ -107,16 +121,19 @@ export class PaperEngine {
 		for (const o of this.getOpenOrders(tokenId)) this.cancelOrder(o.id);
 	}
 
-	// Drive fills from a real trade print on the live feed.
-	onTrade(tokenId: string, tradePrice: number, tradeSize?: number): void {
+	// Drive fills from a real trade print on the live feed and return detailed fill
+	// reports so Telegram can say exactly what filled, on which market, and what the
+	// new position/balance looks like.
+	onTrade(tokenId: string, tradePrice: number, tradeSize?: number): PaperFillReport[] {
+		const reports: PaperFillReport[] = [];
 		const resting = this.getOpenOrders(tokenId);
-		if (resting.length === 0) return;
+		if (resting.length === 0) return reports;
 		const size = tradeSize !== undefined && tradeSize > 0
 			? tradeSize
 			: this.fillUnknownSizeFully
 				? Number.POSITIVE_INFINITY
 				: 0;
-		if (size <= 0) return;
+		if (size <= 0) return reports;
 		const fills = simulateTradeCrossing(resting, tradePrice, size);
 		for (const f of fills) {
 			const o = this.orders.get(f.orderId);
@@ -133,14 +150,31 @@ export class PaperEngine {
 			}
 			o.size -= f.size;
 			this.fillCount += 1;
-			if (o.size <= EPS) {
+			const status: "filled" | "partial" = o.size <= EPS ? "filled" : "partial";
+			if (status === "filled") {
 				o.status = "filled";
 				this.orders.delete(o.id);
 			} else {
 				o.status = "partial";
 			}
+			reports.push({
+				orderId: f.orderId,
+				tokenId: f.tokenId,
+				side: f.side,
+				outcome: f.outcome,
+				price: f.price,
+				size: f.size,
+				notional,
+				fee,
+				strategy: o.strategy,
+				remainingSize: Math.max(0, o.size),
+				balanceAfter: this.balance,
+				positionAfter: this.getPosition(f.tokenId),
+				status,
+			});
 			log.debug(`fill ${f.side} ${f.size.toFixed(1)} @ ${f.price.toFixed(3)} (${o.strategy}) bal=${this.balance.toFixed(2)}`);
 		}
+		return reports;
 	}
 
 	private addShares(tokenId: string, outcome: Outcome, size: number, price: number): void {
@@ -157,14 +191,13 @@ export class PaperEngine {
 	private reduceShares(tokenId: string, outcome: Outcome, size: number, price: number): void {
 		const p = this.positions.get(tokenId);
 		if (!p || p.shares <= EPS) {
-			// Selling with no long inventory opens a short; track at sale price.
 			this.positions.set(tokenId, { tokenId, outcome, shares: -size, avgPrice: price });
 			return;
 		}
 		const matched = Math.min(size, p.shares);
 		this.realizedPnl += (price - p.avgPrice) * matched;
 		p.shares -= size;
-		if (p.shares < -EPS) p.avgPrice = price; // flipped to short
+		if (p.shares < -EPS) p.avgPrice = price;
 	}
 
 	accrueReward(amountUsd: number): void {

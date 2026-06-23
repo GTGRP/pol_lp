@@ -1,9 +1,9 @@
 // CLOB v2 REST client wrapper.
 //
-// Phase 0 scope: public reads (order book, midpoint, reward-bearing markets) plus
-// the L2 HMAC auth header builder used by authenticated reads (order scoring,
-// user reward earnings). L1 (EIP-712) API-key derivation and order signing are
-// scaffolded behind a clearly-marked interface and completed in Phase 3.
+// Public reads: order books, midpoints, and CLOB reward/sampling market metadata.
+// The reward-market discovery path mirrors the useful pattern from reference repos:
+// scan Gamma broadly for active markets, then use CLOB simplified/sampling endpoints
+// as the authoritative source for funded liquidity reward rates.
 import crypto from "node:crypto";
 import { Wallet } from "ethers";
 import type { AppConfig } from "./config.js";
@@ -17,6 +17,28 @@ export interface L2Credentials {
 	apiKey: string;
 	apiSecret: string;
 	passphrase: string;
+}
+
+export interface ClobRewardSnapshot {
+	conditionId: string;
+	tokenId?: string;
+	rewardDailyRate: number;
+	rewardHourlyRate: number;
+	rewardMinSize: number;
+	rewardMaxSpread: number;
+	rewardEpoch?: number;
+	inGameMultiplier?: number;
+	acceptingOrders?: boolean;
+	eventStartDate?: string;
+	eventEndDate?: string;
+	source: string;
+}
+
+export interface ClobRewardState {
+	byToken: Map<string, ClobRewardSnapshot>;
+	byCondition: Map<string, ClobRewardSnapshot>;
+	pages: number;
+	source: string;
 }
 
 function base64UrlToBuffer(s: string): Buffer {
@@ -36,6 +58,26 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs =
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+function num(v: unknown): number {
+	const n = Number(v);
+	return Number.isFinite(n) ? n : 0;
+}
+
+function optBool(v: unknown): boolean | undefined {
+	if (typeof v === "boolean") return v;
+	if (typeof v === "string") {
+		if (v.toLowerCase() === "true") return true;
+		if (v.toLowerCase() === "false") return false;
+	}
+	return undefined;
+}
+
+function normalizeRewardSpread(v: unknown): number {
+	const n = num(v);
+	if (!n) return 0;
+	return n > 1 ? n / 100 : n;
 }
 
 // Build Polymarket L2 (API-key) auth headers: HMAC-SHA256 over
@@ -65,18 +107,13 @@ export function buildL2Headers(
 	};
 }
 
-function normalizeLevels(
-	raw: unknown,
-	sort: "desc" | "asc",
-): OrderBookLevel[] {
+function normalizeLevels(raw: unknown, sort: "desc" | "asc"): OrderBookLevel[] {
 	if (!Array.isArray(raw)) return [];
 	const levels: OrderBookLevel[] = [];
 	for (const item of raw) {
 		const price = Number((item as any)?.price);
-		const size = Number((item as any)?.size);
-		if (Number.isFinite(price) && Number.isFinite(size)) {
-			levels.push({ price, size });
-		}
+		const size = Number((item as any)?.size ?? (item as any)?.shares);
+		if (Number.isFinite(price) && Number.isFinite(size)) levels.push({ price, size });
 	}
 	levels.sort((a, b) => (sort === "desc" ? b.price - a.price : a.price - b.price));
 	return levels;
@@ -94,7 +131,6 @@ export class ClobRestClient {
 			apiSecret: cfg.clobApiSecret,
 			passphrase: cfg.clobApiPassphrase,
 		};
-		// Address used in L2 headers: signing EOA if a key is present, else funder.
 		let addr = cfg.funderAddress;
 		if (cfg.privateKey) {
 			try {
@@ -125,26 +161,18 @@ export class ClobRestClient {
 		} catch (e) {
 			throw new Error(`CLOB GET ${path} timed out/failed: ${(e as Error).message}`);
 		}
-		if (!res.ok) {
-			throw new Error(`CLOB GET ${path} failed: ${res.status} ${res.statusText}`);
-		}
+		if (!res.ok) throw new Error(`CLOB GET ${path} failed: ${res.status} ${res.statusText}`);
 		return (await res.json()) as T;
 	}
 
-	// Authenticated GET using L2 headers. requestPath must be the path used in the HMAC.
 	async getAuthedJson<T>(requestPath: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
-		if (!this.creds.apiKey) {
-			throw new Error("L2 credentials not configured (CLOB_API_KEY/SECRET/PASSPHRASE)");
-		}
+		if (!this.creds.apiKey) throw new Error("L2 credentials not configured (CLOB_API_KEY/SECRET/PASSPHRASE)");
 		const headers = buildL2Headers(this.creds, this.address, "GET", requestPath);
 		const res = await fetchWithTimeout(this.url(requestPath, query), { method: "GET", headers });
-		if (!res.ok) {
-			throw new Error(`CLOB authed GET ${requestPath} failed: ${res.status} ${res.statusText}`);
-		}
+		if (!res.ok) throw new Error(`CLOB authed GET ${requestPath} failed: ${res.status} ${res.statusText}`);
 		return (await res.json()) as T;
 	}
 
-	// Public: full order book for a token.
 	async getOrderBook(tokenId: string): Promise<OrderBookSnapshot> {
 		const raw = await this.getJson<{ bids?: unknown; asks?: unknown }>("/book", { token_id: tokenId });
 		const book = {
@@ -157,7 +185,6 @@ export class ClobRestClient {
 		return book;
 	}
 
-	// Public: midpoint price for a token (returns null if unavailable).
 	async getMidpoint(tokenId: string): Promise<number | null> {
 		try {
 			const raw = await this.getJson<{ mid?: string | number }>("/midpoint", { token_id: tokenId });
@@ -168,17 +195,73 @@ export class ClobRestClient {
 		}
 	}
 
-	// Public: reward-bearing (sampling) markets. Cursor-paginated by the CLOB API.
 	async getSamplingMarkets(nextCursor = ""): Promise<{ data: unknown[]; next_cursor: string }> {
 		return this.getJson("/sampling-markets", { next_cursor: nextCursor });
 	}
 
-	// Authenticated (L2): live scoring status of one of our resting orders. Phase 1 uses this.
+	// Authoritative funded reward-market scan. We try the simplified/sampling endpoints
+	// used by market-maker reference repos, paginate broadly, and only keep entries
+	// with rewards.rates[].rewards_daily_rate > 0.
+	async getRewardMarketSnapshots(maxPages = 30): Promise<ClobRewardState> {
+		const endpoints = ["/sampling-simplified-markets", "/simplified-markets", "/sampling-markets"];
+		for (const endpoint of endpoints) {
+			const byToken = new Map<string, ClobRewardSnapshot>();
+			const byCondition = new Map<string, ClobRewardSnapshot>();
+			let nextCursor = "";
+			let pages = 0;
+			try {
+				while (pages < maxPages) {
+					const payload = await this.getJson<any>(endpoint, nextCursor ? { next_cursor: nextCursor } : undefined);
+					const data = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
+					for (const entry of data) {
+						const conditionId = String(entry?.condition_id ?? entry?.conditionId ?? "").trim();
+						if (!conditionId) continue;
+						const rewards = entry?.rewards ?? {};
+						const rates = Array.isArray(rewards?.rates) ? rewards.rates : [];
+						const rewardMinSize = num(rewards?.min_size ?? rewards?.minSize);
+						const rewardMaxSpread = normalizeRewardSpread(rewards?.max_spread ?? rewards?.maxSpread);
+						const acceptingOrders = optBool(entry?.accepting_orders ?? entry?.acceptingOrders);
+						let best: ClobRewardSnapshot | null = null;
+						for (const r of rates) {
+							const tokenId = String(r?.asset_address ?? r?.assetAddress ?? r?.token_id ?? r?.tokenId ?? "").trim();
+							const rewardDailyRate = num(r?.rewards_daily_rate ?? r?.rewardsDailyRate);
+							if (rewardDailyRate <= 0) continue;
+							const snap: ClobRewardSnapshot = {
+								conditionId,
+								tokenId: tokenId || undefined,
+								rewardDailyRate,
+								rewardHourlyRate: rewardDailyRate / 24,
+								rewardMinSize,
+								rewardMaxSpread,
+								rewardEpoch: num(rewards?.reward_epoch) || undefined,
+								inGameMultiplier: num(rewards?.in_game_multiplier) || undefined,
+								acceptingOrders,
+								eventStartDate: rewards?.event_start_date,
+								eventEndDate: rewards?.event_end_date,
+								source: endpoint,
+							};
+							if (tokenId) byToken.set(tokenId, snap);
+							if (!best || snap.rewardDailyRate > best.rewardDailyRate) best = snap;
+						}
+						if (best) byCondition.set(conditionId, { ...best, tokenId: undefined });
+					}
+					nextCursor = String(payload?.next_cursor ?? payload?.nextCursor ?? "");
+					pages += 1;
+					if (!nextCursor || nextCursor === "LTE=") break;
+				}
+				log.info(`CLOB reward scan ${endpoint}: pages=${pages}, rewardTokens=${byToken.size}, rewardConditions=${byCondition.size}`);
+				if (byToken.size > 0 || byCondition.size > 0) return { byToken, byCondition, pages, source: endpoint };
+			} catch (e) {
+				log.warn(`CLOB reward scan ${endpoint} failed: ${(e as Error).message}`);
+			}
+		}
+		return { byToken: new Map(), byCondition: new Map(), pages: 0, source: "none" };
+	}
+
 	async getOrderScoring(orderId: string): Promise<unknown> {
 		return this.getAuthedJson("/order-scoring", { order_id: orderId });
 	}
 
-	// Authenticated (L2): per-market earnings + reward configuration for the user. Phase 1 uses this.
 	async getUserRewardsEarnings(date?: string): Promise<unknown> {
 		return this.getAuthedJson("/rewards/user/markets", { date });
 	}
@@ -187,9 +270,6 @@ export class ClobRestClient {
 		return this.address;
 	}
 
-	// ---- Phase 3 scaffolding (not yet implemented) ----
-	// Derive/create L2 API credentials from an L1 EIP-712 signature, honoring
-	// signature type 3 (POLY_1271) where the funder is the deposit wallet.
 	async deriveApiKeyL1(): Promise<L2Credentials> {
 		throw new Error("deriveApiKeyL1 not implemented yet (Phase 3): L1 EIP-712 + POLY_1271 funder binding");
 	}
