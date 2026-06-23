@@ -1,0 +1,30 @@
+{
+  "name": "pol_lp",
+  "version": "0.1.0",
+  "description": "Polymarket LP reward farming bot with paper mode and parallel WebSocket order book",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "paper": "cross-env TRADING_MODE=paper node dist/main.js",
+    "live": "cross-env TRADING_MODE=live node dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.12",
+    "cross-env": "^7.0.3",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
