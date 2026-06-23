@@ -11,6 +11,7 @@ import type { OrderBookLevel, OrderBookSnapshot } from "./types.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("clob");
+const FETCH_TIMEOUT_MS = 10_000;
 
 export interface L2Credentials {
 	apiKey: string;
@@ -25,6 +26,16 @@ function base64UrlToBuffer(s: string): Buffer {
 
 function bufferToBase64Url(buf: Buffer): string {
 	return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = FETCH_TIMEOUT_MS): Promise<Response> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		return await fetch(url, { ...init, signal: controller.signal });
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 // Build Polymarket L2 (API-key) auth headers: HMAC-SHA256 over
@@ -106,7 +117,14 @@ export class ClobRestClient {
 	}
 
 	async getJson<T>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
-		const res = await fetch(this.url(path, query), { method: "GET" });
+		const url = this.url(path, query);
+		log.debug(`GET ${url}`);
+		let res: Response;
+		try {
+			res = await fetchWithTimeout(url, { method: "GET" });
+		} catch (e) {
+			throw new Error(`CLOB GET ${path} timed out/failed: ${(e as Error).message}`);
+		}
 		if (!res.ok) {
 			throw new Error(`CLOB GET ${path} failed: ${res.status} ${res.statusText}`);
 		}
@@ -119,7 +137,7 @@ export class ClobRestClient {
 			throw new Error("L2 credentials not configured (CLOB_API_KEY/SECRET/PASSPHRASE)");
 		}
 		const headers = buildL2Headers(this.creds, this.address, "GET", requestPath);
-		const res = await fetch(this.url(requestPath, query), { method: "GET", headers });
+		const res = await fetchWithTimeout(this.url(requestPath, query), { method: "GET", headers });
 		if (!res.ok) {
 			throw new Error(`CLOB authed GET ${requestPath} failed: ${res.status} ${res.statusText}`);
 		}
@@ -129,12 +147,14 @@ export class ClobRestClient {
 	// Public: full order book for a token.
 	async getOrderBook(tokenId: string): Promise<OrderBookSnapshot> {
 		const raw = await this.getJson<{ bids?: unknown; asks?: unknown }>("/book", { token_id: tokenId });
-		return {
+		const book = {
 			tokenId,
 			bids: normalizeLevels(raw.bids, "desc"),
 			asks: normalizeLevels(raw.asks, "asc"),
 			timestamp: Date.now(),
 		};
+		log.debug(`book ${tokenId.slice(0, 8)}... bids=${book.bids.length} asks=${book.asks.length}`);
+		return book;
 	}
 
 	// Public: midpoint price for a token (returns null if unavailable).

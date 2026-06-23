@@ -4,6 +4,7 @@ import type { GammaMarket } from "./types.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("gamma");
+const FETCH_TIMEOUT_MS = 10_000;
 
 function parseMaybeJsonArray(v: unknown): string[] {
 	if (Array.isArray(v)) return v.map((x) => String(x));
@@ -43,6 +44,16 @@ function normalize(raw: Record<string, any>): GammaMarket {
 	};
 }
 
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = FETCH_TIMEOUT_MS): Promise<Response> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		return await fetch(url, { ...init, signal: controller.signal });
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 export class GammaClient {
 	private readonly cfg: AppConfig;
 
@@ -62,6 +73,7 @@ export class GammaClient {
 
 	// Fetch active, open markets ordered by 24h volume (proxy for liquidity/activity).
 	async getActiveMarkets(limit = 50): Promise<GammaMarket[]> {
+		log.info(`fetching active Gamma markets limit=${limit}`);
 		const raw = await this.getJson<Record<string, any>[]>("/markets", {
 			active: true,
 			closed: false,
@@ -69,18 +81,33 @@ export class GammaClient {
 			order: "volume24hr",
 			ascending: false,
 		});
-		if (!Array.isArray(raw)) return [];
-		return raw.map(normalize).filter((m) => m.clobTokenIds.length >= 1);
+		if (!Array.isArray(raw)) {
+			log.warn("Gamma /markets returned non-array response");
+			return [];
+		}
+		const normalized = raw.map(normalize);
+		const tradable = normalized.filter((m) => m.clobTokenIds.length >= 1);
+		log.info(`Gamma active markets: raw=${raw.length}, tradable_with_clob_tokens=${tradable.length}`);
+		return tradable;
 	}
 
 	// Active markets that advertise a reward rate. These are the LP-farming candidates.
 	async getRewardMarkets(limit = 50): Promise<GammaMarket[]> {
 		const markets = await this.getActiveMarkets(limit);
-		return markets.filter((m) => (m.rewardsDailyRate ?? 0) > 0);
+		const rewardMarkets = markets.filter((m) => (m.rewardsDailyRate ?? 0) > 0);
+		log.info(`Gamma reward markets: ${rewardMarkets.length}/${markets.length}`);
+		return rewardMarkets;
 	}
 
 	private async getJson<T>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
-		const res = await fetch(this.url(path, query), { method: "GET" });
+		const url = this.url(path, query);
+		log.debug(`GET ${url}`);
+		let res: Response;
+		try {
+			res = await fetchWithTimeout(url, { method: "GET" });
+		} catch (e) {
+			throw new Error(`Gamma GET ${path} timed out/failed: ${(e as Error).message}`);
+		}
 		if (!res.ok) {
 			throw new Error(`Gamma GET ${path} failed: ${res.status} ${res.statusText}`);
 		}
